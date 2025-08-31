@@ -227,6 +227,51 @@ func (mb *tcpTransporter) connect() error {
 
 }
 
+// --- 新增带本地绑定的导出方法 ---
+func (mb *tcpTransporter) ConnectWithLocal(localAddr string, localPort int) error {
+	return mb.connectWithLocal(localAddr, localPort)
+}
+
+// --- 内部方法：仅带本地绑定的TCP拨号 ---
+func (mb *tcpTransporter) tcpConnectWithLocal(localAddr string, localPort int) error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	if mb.conn == nil {
+		dialer := net.Dialer{
+			LocalAddr: &net.TCPAddr{
+				IP:   net.ParseIP(localAddr),
+				Port: localPort,
+			},
+			Timeout: mb.Timeout,
+		}
+		conn, err := dialer.Dial("tcp", mb.Address)
+		if err != nil {
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return err
+		}
+		mb.conn = conn
+	}
+	return nil
+}
+
+// --- 内部方法：带本地绑定的完整握手连接 ---
+func (mb *tcpTransporter) connectWithLocal(localAddr string, localPort int) error {
+	err := mb.tcpConnectWithLocal(localAddr, localPort)
+	if err != nil {
+		return err
+	}
+	err = mb.isoConnect()
+	if err != nil {
+		if mb.conn != nil {
+			_ = mb.conn.Close()
+		}
+		return err
+	}
+	return mb.negotiatePduLength()
+}
+
 func (mb *tcpTransporter) isoConnect() error {
 	msg := make([]byte, len(isoConnectionRequestTelegram))
 	copy(msg, isoConnectionRequestTelegram)
