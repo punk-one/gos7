@@ -84,6 +84,6 @@ for _, ip := range lanIPs {
 
 ## 拓扑示意图（PNG）
 
-![多网卡绑定多个PLC示意图]https://raw.githubusercontent.com/punk-one/gos7/master/local_bind.png)
+![多网卡绑定多个PLC示意图](https://raw.githubusercontent.com/punk-one/gos7/master/local_bind.png)
 
 > 图示：本机 4 个网卡分别连接到 4 台 PLC，每台 PLC 的 IP 相同 (10.1.13.180)，但通过物理隔离的网络实现并行访问。
