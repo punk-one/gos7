@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-//Client interface s7 client
+// Client interface s7 client
 type Client interface {
 	/***************start API AG (Automatisationsgerät)***************/
 	//Read data blocks from PLC
@@ -38,6 +38,16 @@ type Client interface {
 	AGReadMulti(dataItems []S7DataItem, itemsCount int) (err error)
 	//multi write area
 	AGWriteMulti(dataItems []S7DataItem, itemsCount int) (err error)
+	/***************start API AG (Automatisationsgerät)***************/
+	//Read data from PLC NCK
+	AGReadNCK(addrItem *S7NckAddrItem) (dataItem *S7NckDataItem, err error)
+	//write data into PLC  NCK
+	AGWriteNCK(addrItem *S7NckAddrItem, dataItem *S7NckDataItem) (returnCode byte, err error)
+	//Read multi data from PLC NCK
+	AGReadMultiNCK(addrItems *[]S7NckAddrItem) (dataItems *[]S7NckDataItem, err error)
+	//write multi data into PLC  NCK
+	AGWriteMultiNCK(addrItems *[]S7NckAddrItem, dataItems *[]S7NckDataItem) (returnCodes []byte, err error)
+
 	/*block*/
 	DBFill(dbnumber int, fillchar int) error
 	DBGet(dbnumber int, usrdata []byte, size int) error

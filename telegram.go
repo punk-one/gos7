@@ -37,12 +37,16 @@ var tpktISOTelegram = []byte{ // 7 bytes
 	0, 31, // Telegram Length (Data Size + 31 or 35)
 	2, 240, 128} // COTP (see above for info)
 // S7 PDU Negotiation Telegram (contains also ISO Header and COTP Header)
+// var s7PDUNegogiationTelegram = []byte{
+// 	3, 0, 0, 25,
+// 	2, 240, 128, // TPKT + COTP (see above for info)
+// 	50, 1, 0, 0, 4, 0, 0, 8, 0, 0, 240, 0, 0, 1, 0, 1,
+// 	1, 224} // PDU Length Requested = HI-LO Here Default 480 bytes
 var s7PDUNegogiationTelegram = []byte{
 	3, 0, 0, 25,
 	2, 240, 128, // TPKT + COTP (see above for info)
-	50, 1, 0, 0, 4, 0, 0, 8, 0, 0, 240, 0, 0, 1, 0, 1,
-	1, 224} // PDU Length Requested = HI-LO Here Default 480 bytes
-
+	50, 1, 0, 0, 0, 20, 0, 8, 0, 0, 240, 0, 0, 1, 0, 1,
+	1, 224} /
 // S7 Read/Write Request Header (contains also ISO Header and COTP Header)
 var s7ReadWriteTelegram = []byte{ // 31-35 bytes
 	3, 0,
@@ -173,6 +177,60 @@ var s7HotStartTelegram = []byte{
 var s7ColdStartTelegram = []byte{
 	3, 0, 0, 39, 2, 240, 128, 50, 1, 0, 0, 15, 0, 0, 22, 0, 0, 40, 0, 0,
 	0, 0, 0, 0, 253, 0, 2, 67, 32, 9, 80, 95, 80, 82, 79, 71, 82, 65, 77}
+
+var s7NckPDUNegogiationTelegram = []byte{
+	3, 0, 0, 25,
+	2, 240, 128, // TPKT + COTP (see above for info)
+	50, 1, 0, 0, 0, 20, 0, 8, 0, 0, 240, 0, 0, 1, 0, 1,
+	1, 224} // PDU Length Requested = HI-LO Here Default 480 bytes
+
+var s7NckReadWriteTelegram = []byte{ // 31-35 bytes
+	3, 0,
+	0, 29, // Telegram Length (DataLen*10 + 19)
+	2, 240, 128, // COTP (see above for info)
+	50,    // S7 Protocol ID
+	1,     // Job Type
+	0, 00, // Redundancy identification
+	0, 20, // Protocol Data Unit Reference:
+	0, 12, // Parameters Length  #13
+	0, 0, // Data Length = Size(bytes) + 4 # 15:
+	4, // Function 4 Read Var, 5 Write Var
+	1, // Items count  # 18
+	//18,   // Var spec.
+	//8,    // Length of remaining bytes #20 NCK 固定为8
+	//130,  // Syntax ID #21  NCK为130
+	//0,    // Transport Size idx=22  ## Area|Unit
+	//0, 0, // Num Elements  ## ColNum 占2位
+	//0, 0, // DB Number (if any, else 0) #LineNum 占2位
+	//0, // Area Type  # StateData
+	//1, // lineCount  # 28  S7共29位
+}
+var s7NckReadTelegramTPKT = []byte{
+	3, 0, 0, 7, // TPKT Version3 Length 7
+	2, 240, 0, // ISO COTP
+}
+
+var s7NckWriteTelegram = []byte{ // 31-35 bytes
+	3, 0,
+	0, 29, // # 2: Telegram Length (Data Size + 29)
+	2, 240, 128, // COTP (see above for info)
+	50,    // S7 Protocol ID
+	1,     // Job Type
+	0, 00, // Redundancy identification
+	0, 20, // Protocol Data Unit Reference:
+	0, 12, // Parameters Length
+	0, 0, // Data Length = Size(bytes) + 4   # 15
+	5,    // Function 4 Read Var, 5 Write Var
+	1,    // Items count
+	18,   // Var spec.
+	8,    // Length of remaining bytes #20 NCK 固定为8
+	130,  // Syntax ID #21  NCK为130
+	0,    // Transport Size idx=22  ## Area|Unit
+	0, 0, // Num Elements  ## ColNum 占2位
+	0, 0, // DB Number (if any, else 0) #LineNum 占2位
+	0, // Area Type  # StateData
+	1,
+}
 
 const (
 	pduStart          = 0x28 // CPU start

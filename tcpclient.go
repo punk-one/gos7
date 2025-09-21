@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -29,6 +30,13 @@ const (
 	connectionTypePG    = 1 // Connect to the PLC as a PG
 	connectionTypeOP    = 2 // Connect to the PLC as an OP
 	connectionTypeBasic = 3 // Basic connection
+)
+
+const (
+	// 手动定义TCP NOP选项值
+	TCP_NOP = 0x01
+	// 手动定义TCP时间戳选项值
+	TCP_TIMESTAMP = 0x08
 )
 
 // TCPClientHandler implements Packager and Transporter interface.
@@ -106,6 +114,44 @@ type tcpTransporter struct {
 	PDULength int
 }
 
+func setTCPOptions(tcpConn *net.TCPConn) {
+	// 创建TCP选项数据
+	// 创建TCP选项数据
+	options := []byte{
+		0x01,       // NOP
+		0x01,       // NOP
+		0x08, 0x0a, // 时间戳选项长度 + 类型
+		0x00, 0x00, 0x00, 0x00, // 时间戳值预留空间
+		0x00, 0x00, 0x00, 0x00, // 回声时间戳值预留空间
+	}
+	// 获取当前时间戳
+	now := time.Now().UnixNano() / 1000000 // 转换成毫秒
+	timestamp := uint32(now)
+	// 填充时间戳值
+	copy(options[4:], []byte{
+		byte(timestamp >> 24),
+		byte(timestamp >> 16),
+		byte(timestamp >> 8),
+		byte(timestamp),
+	})
+	// 设置TCP选项
+	// 获取连接的文件描述符
+	fd, err := tcpConn.File()
+	if err != nil {
+		fmt.Println("Error getting file:", err)
+		return
+	}
+	defer fd.Close()
+	// 使用 uintptr 转换为 int
+	fdHandle := syscall.Handle(fd.Fd())
+	// 设置 TCP 保活选项
+	syscall.SetsockoptInt(fdHandle, syscall.IPPROTO_TCP, 1, 1) // 设置开始 Keepalive 的时间
+	syscall.SetsockoptInt(fdHandle, syscall.IPPROTO_TCP, 1, 1) // 设置开始 Keepalive 的时间
+	syscall.Setsockopt(fdHandle, syscall.IPPROTO_TCP, 8, &options[4], 10)
+	syscall.Setsockopt(fdHandle, syscall.SOCK_RAW, 8, &options[4], 10)
+	return
+}
+
 func (mb *tcpTransporter) setConnectionParameters(address string, localTSAP uint16, remoteTSAP uint16) {
 	locTSAP := localTSAP & 0x0000FFFF
 	remTSAP := remoteTSAP & 0x0000FFFF
@@ -139,9 +185,11 @@ func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	if err = mb.conn.SetDeadline(timeout); err != nil {
 		return
 	}
+	tcpConn := mb.conn.(*net.TCPConn)
+	setTCPOptions(tcpConn)
 	// Send data
 	mb.logf("s7: sending % x", request)
-	if _, err = mb.conn.Write(request); err != nil {
+	if _, err = tcpConn.Write(request); err != nil {
 		return
 	}
 	done := false

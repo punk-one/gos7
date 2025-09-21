@@ -8,7 +8,7 @@ import (
 	"fmt"
 )
 
-//S7DataItem which expose as S7DataItem to use in Multiple read/write
+// S7DataItem which expose as S7DataItem to use in Multiple read/write
 type S7DataItem struct {
 	Area     int
 	WordLen  int
@@ -20,7 +20,40 @@ type S7DataItem struct {
 	Error    string
 }
 
-//implement WriteMulti
+/**
+ * S7NckDataItem：
+ *
+ * ReturnCode ：1 Byte 0xff 代表成功,0x0a代表失败 ;写入时为0 Reserved
+ * TransportSize : 0x09:OCTET String;
+ * Length : 2 Byte data长度
+ * Data : 数据： 格式为TransportSize
+ */
+type S7NckAddrItem struct {
+	Area   int
+	Unit   int
+	Column int
+	Line   int
+	Module int
+}
+
+/**
+ * S7NckDataItem：
+ *
+ * ReturnCode ：1 Byte 读返回：0xff 代表成功,0x0a代表失败 ; 写入时为0 Reserved
+ * TransportSize : 0x09:OCTET String;
+ * Length : 2 Byte data长度
+ * Data : 数据： 格式为TransportSize
+ */
+type S7NckDataItem struct {
+	ReturnCode    int
+	TransportSize int
+	Length        int
+	Data          []byte
+}
+
+type S7NckReturnCode byte
+
+// implement WriteMulti
 func (mb *client) AGWriteMulti(dataItems []S7DataItem, itemsCount int) (err error) {
 	// Checks items
 	if itemsCount > 20 { //max variable is 20
@@ -137,7 +170,7 @@ func (mb *client) AGWriteMulti(dataItems []S7DataItem, itemsCount int) (err erro
 	return
 }
 
-//implement ReadMulti
+// implement ReadMulti
 func (mb *client) AGReadMulti(dataItems []S7DataItem, itemsCount int) (err error) {
 	// Checks items
 	if itemsCount > 20 { //max variable is 20
