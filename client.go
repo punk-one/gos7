@@ -1,793 +1,1317 @@
 package gos7
 
-// Copyright 2018 Trung Hieu Le. All rights reserved.
-// This software may be modified and distributed under the terms
-// of the BSD license. See the LICENSE file for details.
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
+	"errors"
 	"fmt"
-	"strconv"
-	"strings"
+	"math"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/punk-one/gos7/internal/isotcp"
+	"github.com/punk-one/gos7/internal/protocol"
 )
 
 const (
-	// Area ID
-	s7areape = 0x81 //process inputs
-	s7areapa = 0x82 //process outputs
-	s7areamk = 0x83 //Merkers
-	s7areadb = 0x84 //DB
-	s7areact = 0x1C //counters
-	s7areatm = 0x1D //timers
-
-	// Word Length
-	s7wlbit     = 0x01 //Bit (inside a word)
-	s7wlbyte    = 0x02 //Byte (8 bit)
-	s7wlChar    = 0x03
-	s7wlword    = 0x04 //Word (16 bit)
-	s7wlint     = 0x05
-	s7wldword   = 0x06 //Double Word (32 bit)
-	s7wldint    = 0x07
-	s7wlreal    = 0x08 //Real (32 bit float)
-	s7wlcounter = 0x1C //Counter (16 bit)
-	s7wltimer   = 0x1D //Timer (16 bit)
-
-	// PLC Status
-	s7CpuStatusUnknown = 0
-	s7CpuStatusRun     = 8
-	s7CpuStatusStop    = 4
-
-	//size header
-	sizeHeaderRead  int = 31 // Header Size when Reading
-	sizeHeaderWrite int = 35 // Header Size when Writing
-	//
-	sizeNckHeaderRead  int = 19 // Header Size when Reading
-	sizeNckHeaderWrite int = 19 // Header Size when Writing
-
-	// Result transport size
-	tsResBit   = 3
-	tsResByte  = 4
-	tsResInt   = 5
-	tsResReal  = 7
-	tsResOctet = 9
+	maxAmQCaller = 1
+	maxAmQCallee = 1
 )
 
-const (
-	s7WriteReadFunction = 0x04
-	s7WriteVarFunction  = 0x05
-)
+// Client owns exactly one physical S7 session. It is safe for concurrent
+// callers; complete logical operations are serialized on that session.
+type Client struct {
+	config  normalizedConfig
+	gate    chan struct{}
+	lifeCtx context.Context
+	cancel  context.CancelFunc
 
-//PDULength variable to store pdu length after connect
-//var tt, _ := mb.transporter.(*tcpTransporter)tt, _ := mb.transporter.(*tcpTransporter) int //global variable pdulength
-
-// CliePDULengthntHandler is the interface that groups the Packager and Transporter methods.
-type ClientHandler interface {
-	Packager
-	Transporter
-}
-type client struct {
-	packager    Packager
-	transporter Transporter
-}
-
-// NewClient creates a new s7 client with given backend handler.
-func NewClient(handler ClientHandler) Client {
-	return &client{packager: handler, transporter: handler}
-}
-
-// NewClient2 creates a new s7 client with given backend packager and transporter.
-func NewClient2(packager Packager, transporter Transporter) Client {
-	return &client{packager: packager, transporter: transporter}
+	mu                     sync.RWMutex
+	state                  State
+	conn                   net.Conn
+	reference              uint16
+	sessionGeneration      uint64
+	limits                 SessionLimits
+	limitsValid            bool
+	localAddress           string
+	remoteAddress          string
+	lastActivity           time.Time
+	lastSessionFailureKind ErrorKind
+	closeOnce              sync.Once
 }
 
-// implement of the interface AGReadDB
-func (mb *client) AGReadDB(dbnumber int, start int, size int, buffer []byte) (err error) {
-	return mb.readArea(s7areadb, dbnumber, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGWriteDB
-func (mb *client) AGWriteDB(dbNumber int, start int, size int, buffer []byte) (err error) {
-	return mb.writeArea(s7areadb, dbNumber, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGReadMB
-func (mb *client) AGReadMB(start int, size int, buffer []byte) (err error) {
-	return mb.readArea(s7areamk, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGWriteMB
-func (mb *client) AGWriteMB(start int, size int, buffer []byte) (err error) {
-	return mb.writeArea(s7areamk, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGReadEB
-func (mb *client) AGReadEB(start int, size int, buffer []byte) (err error) {
-	return mb.readArea(s7areape, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGWriteEB
-func (mb *client) AGWriteEB(start int, size int, buffer []byte) (err error) {
-	return mb.writeArea(s7areape, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGReadAB
-func (mb *client) AGReadAB(start int, size int, buffer []byte) (err error) {
-	return mb.readArea(s7areapa, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGWriteAB
-func (mb *client) AGWriteAB(start int, size int, buffer []byte) (err error) {
-	return mb.writeArea(s7areapa, 0, start, size, s7wlbyte, buffer)
-}
-
-// implement of the interface AGReadTM - read timer
-func (mb *client) AGReadTM(start int, amount int, buffer []byte) (err error) {
-	sbuffer := make([]byte, amount*2)
-	err = mb.readArea(s7areatm, 0, start, amount, s7wltimer, sbuffer)
-	if err == nil {
-		for c := 0; c < amount; c++ {
-			buffer[c] = byte(uint16(sbuffer[c*2+1])<<8 + uint16(sbuffer[c*2]))
-		}
-	}
-	return err
-}
-
-// implement of the interface AGWriteTM - write timer
-func (mb *client) AGWriteTM(start int, amount int, buffer []byte) (err error) {
-	sbuffer := make([]byte, amount*2)
-	for c := 0; c < amount; c++ {
-		sbuffer[c*2+1] = byte((uint(buffer[c]) & uint(0xFF00)) >> 8)
-		sbuffer[c*2] = byte(buffer[c] & 0x00FF)
-	}
-	err = mb.writeArea(s7areatm, 0, start, amount, s7wltimer, sbuffer)
-	return err
-}
-
-// implement of the interface AGReadCT - read counter
-func (mb *client) AGReadCT(start int, amount int, buffer []byte) (err error) {
-	sbuffer := make([]byte, amount*2)
-	err = mb.readArea(s7areact, 0, start, amount, s7wlcounter, sbuffer)
-	if err == nil {
-		for c := 0; c < amount; c++ {
-			buffer[c] = byte(uint(sbuffer[c*2+1])<<8 + uint(sbuffer[c*2]))
-		}
-	}
-	return err
-}
-
-// implement of the interface AGWriteCT - write counter
-func (mb *client) AGWriteCT(start int, amount int, buffer []byte) (err error) {
-	sbuffer := make([]byte, amount*2)
-	for c := 0; c < amount; c++ {
-		sbuffer[c*2+1] = byte((uint(buffer[c]) & uint(0xFF00)) >> 8)
-		sbuffer[c*2] = byte(buffer[c] & 0x00FF)
-	}
-	err = mb.writeArea(s7areact, 0, start, amount, s7wlcounter, sbuffer)
-	return err
-}
-
-// implement of the interface AGReadNCK
-func (mb *client) AGReadNCK(addrItem *S7NckAddrItem) (dataItem *S7NckDataItem, err error) {
-	addrItems := []S7NckAddrItem{*addrItem}
-	dataItems := make([]S7NckDataItem, 0)
-	err = mb.readNckArea(&addrItems, &dataItems)
-	return &dataItems[0], err
-}
-
-// implement of the interface AGWriteNCK
-func (mb *client) AGWriteNCK(addrItem *S7NckAddrItem, dataItem *S7NckDataItem) (returnCode byte, err error) {
-	addrItems := []S7NckAddrItem{*addrItem}
-	dataItems := []S7NckDataItem{*dataItem}
-	returnCodes, err := mb.writeNckArea(&addrItems, &dataItems)
-	return returnCodes[0], err
-}
-
-// implement of the interface AGReadMultiNCK
-func (mb *client) AGReadMultiNCK(addrItems *[]S7NckAddrItem) (dataItems *[]S7NckDataItem, err error) {
-	respItems := make([]S7NckDataItem, 0)
-	err = mb.readNckArea(addrItems, &respItems)
-	return &respItems, err
-}
-
-// implement of the interface AGWriteMultiNCK
-func (mb *client) AGWriteMultiNCK(addrItems *[]S7NckAddrItem, dataItems *[]S7NckDataItem) (returnCodes []byte, err error) {
-
-	return mb.writeNckArea(addrItems, dataItems)
-}
-
-// read generic area, pass result into a buffer
-func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLen int, buffer []byte) (err error) {
-	var address, numElements, maxElements, totElements, sizeRequested int
-	offset := 0
-	wordSize := 1
-	// Some adjustment
-	if area == s7areact {
-		wordLen = s7wlcounter
-	}
-	if area == s7areatm {
-		wordLen = s7wltimer
-	}
-	// Calc Word size
-	wordSize = dataSizeByte(wordLen)
-	if wordSize == 0 {
-		return fmt.Errorf(ErrorText(errIsoInvalidDataSize))
-	}
-
-	if wordLen == s7wlbit {
-		amount = 1 // Only 1 bit can be transferred at time
-	} else {
-		if wordLen != s7wlcounter && wordLen != s7wltimer {
-			amount = amount * wordSize
-			wordSize = 1
-			wordLen = s7wlbyte
-		}
-	}
-
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
-
-	maxElements = (tt.PDULength - 18) / wordSize // 18 = Reply telegram header //lth note here
-	totElements = amount
-	for totElements > 0 && err == nil {
-		numElements = totElements
-		if numElements > maxElements {
-			numElements = maxElements
-		}
-
-		sizeRequested = numElements * wordSize
-		// Setup the telegram
-		requestData := make([]byte, sizeHeaderRead)
-		copy(requestData[0:], s7ReadWriteTelegram[0:])
-		request := NewProtocolDataUnit(requestData)
-		// Set DB Number
-		request.Data[27] = byte(area)
-		// Set Area
-		if area == s7areadb {
-			binary.BigEndian.PutUint16(request.Data[25:], uint16(dbNumber))
-			//SetWordAt(request.Data, 25, uint16(DBNumber))
-		}
-
-		// Adjusts Start and word length
-		if wordLen == s7wlbit || wordLen == s7wlcounter || wordLen == s7wltimer {
-			address = start
-			request.Data[22] = byte(wordLen)
-		} else {
-			address = start << 3
-		}
-		// Num elements
-		binary.BigEndian.PutUint16(request.Data[23:], uint16(numElements))
-		//SetWordAt(request.Data, 23, uint16(numElements))
-		// Address into the PLC (only 3 bytes)
-		request.Data[30] = byte(address & 0x0FF)
-		address = address >> 8
-		request.Data[29] = byte(address & 0x0FF)
-		address = address >> 8
-		request.Data[28] = byte(address & 0x0FF)
-		var response *ProtocolDataUnit
-		response, sendError := mb.send(&request)
-		err = sendError
-
-		if err == nil {
-			if size := len(response.Data); size < 25 {
-				err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", len(response.Data))
-			} else {
-				if response.Data[21] != 0xFF {
-					err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
-				} else {
-					//copy response to buffer
-					copy(buffer[offset:offset+sizeRequested], response.Data[25:25+sizeRequested])
-					offset += sizeRequested
-				}
-			}
-
-		}
-		totElements -= numElements
-		start += numElements * wordSize
-	}
-	return
-}
-
-// writeArea write generic area into PLC with following parameters:
-// 1.area: s7areape/s7areapa/s7areamk/s7areadb/s7areact/s7areatm
-// 2.dbnumber: specify dbnumber, to use in write DB area, otherwise = 0
-// 3.start: start of the address
-// 4.amount: amount of the address
-// 5.wordlen: bit/byte/word/dword/real/counter/timer
-// 6.buffer: a byte array input for writing
-func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordlen int, buffer []byte) (err error) {
-	var address, numElements, maxElements, totElements, dataSize, isoSize, length int
-	offset := 0
-	wordSize := 1
-
-	// Some adjustment
-	if area == s7areact {
-		wordlen = s7wlcounter
-	}
-	if area == s7areatm {
-		wordlen = s7wltimer
-	}
-
-	// Calc Word size
-	wordSize = dataSizeByte(wordlen)
-	if wordSize == 0 {
-		return fmt.Errorf(ErrorText(errIsoInvalidDataSize))
-	}
-
-	if wordlen == s7wlbit {
-		amount = 1 // Only 1 bit can be transferred at time
-	} else {
-		if wordlen != s7wlcounter && wordlen != s7wltimer {
-			amount = amount * wordSize
-			wordSize = 1
-			wordlen = s7wlbyte
-		}
-	}
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
-	maxElements = (tt.PDULength - 35) / wordSize // 35 = Reply telegram header
-	totElements = amount
-	for totElements > 0 && err == nil {
-		numElements = totElements
-		if numElements > maxElements {
-			numElements = maxElements
-		}
-		dataSize = numElements * wordSize
-		isoSize = sizeHeaderWrite + dataSize
-
-		// Setup the telegram
-		requestData := make([]byte, sizeHeaderWrite)
-		copy(requestData[0:], s7ReadWriteTelegram[0:])
-
-		request := NewProtocolDataUnit(requestData)
-		// Whole telegram Size
-		binary.BigEndian.PutUint16(request.Data[2:], uint16(isoSize))
-		//SetWordAt(request.Data, 2, uint16(isoSize))
-		// Data length
-		length = dataSize + 4
-		binary.BigEndian.PutUint16(request.Data[15:], uint16(length))
-		// SetWordAt(request.Data, 15, uint16(length))
-		// Function
-		request.Data[17] = byte(0x05)
-		// Set DB Number
-		request.Data[27] = byte(area)
-		if area == s7areadb {
-			binary.BigEndian.PutUint16(request.Data[25:], uint16(dbnumber))
-			//SetWordAt(request.Data, 25, uint16(dbnumber))
-		}
-		// Adjusts start and word length
-		if wordlen == s7wlbit || wordlen == s7wlcounter || wordlen == s7wltimer {
-			address = start
-			length = dataSize
-			request.Data[22] = byte(wordlen)
-		} else {
-			address = start << 3
-			length = dataSize << 3
-		}
-
-		// Num elements
-		binary.BigEndian.PutUint16(request.Data[23:], uint16(numElements))
-		// SetWordAt(request.Data, 23, uint16(numElements))
-		// address into the PLC
-		request.Data[30] = byte(address & 0x0FF)
-		address = address >> 8
-		request.Data[29] = byte(address & 0x0FF)
-		address = address >> 8
-		request.Data[28] = byte(address & 0x0FF)
-
-		// Transport Size
-		switch wordlen {
-		case s7wlbit:
-			request.Data[32] = tsResBit
-			break
-		case s7wlcounter:
-		case s7wltimer:
-			request.Data[32] = tsResOctet
-			break
-		default:
-			request.Data[32] = tsResByte // byte/word/dword etc.
-			break
-		}
-		// length
-		// SetWordAt(request.Data, 33, uint16(length))
-		binary.BigEndian.PutUint16(request.Data[33:], uint16(length))
-
-		//expand values into array
-		request.Data = append(request.Data[:35], append(buffer[offset:offset+dataSize], request.Data[35:]...)...)
-		response, sendError := mb.send(&request)
-		err = sendError
-		if err == nil {
-			if length = len(response.Data); length == 22 {
-				if response.Data[21] != byte(0xFF) {
-					err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
-				}
-			} else {
-				err = fmt.Errorf(ErrorText(errIsoInvalidPDU))
-			}
-
-		}
-		offset += dataSize
-		totElements -= numElements
-		start += numElements * wordSize
-	}
-	return
-}
-
-// DBRead
-func (mb *client) Read(variable string, buffer []byte) (value interface{}, err error) {
-	variable = strings.ToUpper(variable)              //upper
-	variable = strings.Replace(variable, " ", "", -1) //remove spaces
-
-	if variable == "" {
-		err = fmt.Errorf("input variable is empty, variable should be S7 syntax")
-		return
-	}
-	//var area, dbNumber, start, amount, wordLen int
-	switch valueArea := variable[0:2]; valueArea {
-	case "EB": //input byte
-	case "EW": //input word
-	case "ED": //Input double-word
-	case "AB": //Output byte
-	case "AW": //Output word
-	case "AD": //Output double-word
-	case "MB": //Memory byte
-	case "MW": //Memory word
-	case "MD": //Memory double-word
-	case "DB": //Data Block
-		dbArray := strings.Split(variable, ".")
-		if len(dbArray) < 2 {
-			err = fmt.Errorf("Db Area read variable should not be empty")
-			return
-		}
-		dbNo, _ := strconv.ParseInt(string(string(dbArray[0])[2:]), 10, 16)
-		dbIndex, _ := strconv.ParseInt(string(string(dbArray[1])[3:]), 10, 16)
-		dbType := string(dbArray[1])[0:3]
-
-		switch dbType {
-		case "DBB": //byte
-			err = mb.AGReadDB(int(dbNo), int(dbIndex), 1, buffer)
-			value = buffer[0]
-			return
-		case "DBW": //word
-			err = mb.AGReadDB(int(dbNo), int(dbIndex), 2, buffer)
-			value = binary.BigEndian.Uint16(buffer[0:])
-			return
-		case "DBD": //dword
-			err = mb.AGReadDB(int(dbNo), int(dbIndex), 4, buffer)
-			value = binary.BigEndian.Uint32(buffer[0:])
-			return
-		case "DBX": //bit
-			mBit, _ := strconv.ParseInt(string(string(dbArray[2])[0:]), 10, 16)
-			if mBit > 7 || mBit < 0 {
-				err = fmt.Errorf("Db read bit is invalid")
-				return
-			}
-			err = mb.AGReadDB(int(dbNo), int(dbIndex), 1, buffer)
-			mask := []byte{0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}
-			value = buffer[0] & mask[mBit]
-			return
-		default:
-			err = fmt.Errorf("error when parsing dbtype")
-			return
-		}
-	default:
-		switch otherArea := variable[0:1]; otherArea {
-		case "E":
-		case "I": //input
-		case "A":
-		case "0": //output
-		case "M": //memory
-		case "T": //timer
-			startByte, _ := strconv.ParseInt(string(variable[1:]), 10, 16)
-			err = mb.AGReadTM(int(startByte), 1, buffer)
-			if err != nil {
-				return
-			}
-			helper := Helper{}
-			helper.GetValueAt(buffer, 0, value)
-			return
-		case "Z":
-		case "C": //counter
-			startByte, _ := strconv.ParseInt(string(variable[1:]), 10, 16)
-			err = mb.AGReadCT(int(startByte), 1, buffer)
-			if err != nil {
-				return
-			}
-			helper := Helper{}
-			helper.GetValueAt(buffer, 0, value)
-			return
-		default:
-			err = fmt.Errorf("error when parsing db area")
-			return
-		}
-
-	}
-	return
-}
-
-// send the package of a pdu request and a pdu response, check for response error and verify the package
-func (mb *client) send(request *ProtocolDataUnit) (response *ProtocolDataUnit, err error) {
-	dataResponse, err := mb.transporter.Send(request.Data)
+// New validates configuration without opening a network connection.
+func New(config Config) (*Client, error) {
+	normalized, err := normalizeConfig(config)
 	if err != nil {
-		return
+		return nil, err
 	}
-
-	if err = mb.packager.Verify(request.Data, dataResponse); err != nil {
-		return
-	}
-	if dataResponse == nil || len(dataResponse) == 0 {
-		// Empty response
-		err = fmt.Errorf("s7: response data is empty")
-		return
-	}
-	response = &ProtocolDataUnit{
-		Data: dataResponse,
-	}
-	//check for error if any
-	err = responseError(response)
-	return response, err
+	lifeCtx, cancel := context.WithCancel(context.Background())
+	return &Client{
+		config:  normalized,
+		gate:    make(chan struct{}, 1),
+		lifeCtx: lifeCtx,
+		cancel:  cancel,
+		state:   StateNew,
+	}, nil
 }
 
-// responseError get response error from pdu return S7Error with high and low byte
-func responseError(response *ProtocolDataUnit) error {
-	s7Error := &S7Error{}
-	if response.Data != nil && len(response.Data) > 0 {
-		switch int(response.Data[1]) {
-		case 1:
-		case 7:
-			s7Error.High = response.Data[2]
-			s7Error.Low = response.Data[3]
+// Dial is equivalent to New followed by Connect.
+func Dial(ctx context.Context, config Config) (*Client, error) {
+	client, err := New(config)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Connect(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+// Connect establishes TCP, COTP, and S7 Setup Communication. It does not
+// perform controller detection, SZL reads, reconnect, or retry.
+func (client *Client) Connect(ctx context.Context) error {
+	if client == nil {
+		return invalidError("connect", "nil client")
+	}
+	if ctx == nil {
+		return invalidError("connect", "nil context")
+	}
+	if err := client.acquire(ctx); err != nil {
+		return err
+	}
+	defer client.release()
+
+	state := client.State()
+	if state == StateClosed || state == StateClosing {
+		return newError("connect", ErrorClosed, SessionUnchanged, nil)
+	}
+	if state == StateReady {
+		return nil
+	}
+
+	operationCtx, cleanup := client.operationContext(ctx, client.config.ConnectTimeout)
+	defer cleanup()
+	if err := operationCtx.Err(); err != nil {
+		return client.classifyContextError("connect", operationCtx, SessionUnchanged, err)
+	}
+
+	client.mu.Lock()
+	if client.state == StateClosed || client.state == StateClosing {
+		client.mu.Unlock()
+		return newError("connect", ErrorClosed, SessionUnchanged, nil)
+	}
+	client.state = StateConnecting
+	client.mu.Unlock()
+
+	dialer := net.Dialer{
+		LocalAddr: client.config.localAddr,
+		KeepAlive: client.config.KeepAlive,
+	}
+	connection, err := dialer.DialContext(operationCtx, "tcp", client.config.endpoint)
+	if err != nil {
+		failure := client.classifyContextError("connect.tcp", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	if tcpConnection, ok := connection.(*net.TCPConn); ok {
+		if err := tcpConnection.SetNoDelay(true); err != nil {
+			_ = connection.Close()
+			client.failConnect(ErrorTransport)
+			return newError("connect.tcp_no_delay", ErrorTransport, SessionUnchanged, err)
+		}
+		if client.config.KeepAlive > 0 {
+			if err := tcpConnection.SetKeepAlive(true); err != nil {
+				_ = connection.Close()
+				client.failConnect(ErrorTransport)
+				return newError("connect.keepalive", ErrorTransport, SessionUnchanged, err)
+			}
+			if err := tcpConnection.SetKeepAlivePeriod(client.config.KeepAlive); err != nil {
+				_ = connection.Close()
+				client.failConnect(ErrorTransport)
+				return newError("connect.keepalive_period", ErrorTransport, SessionUnchanged, err)
+			}
+		}
+	}
+
+	client.mu.Lock()
+	if client.state == StateClosed || client.state == StateClosing {
+		client.mu.Unlock()
+		_ = connection.Close()
+		return newError("connect", ErrorClosed, SessionUnchanged, nil)
+	}
+	client.conn = connection
+	client.mu.Unlock()
+
+	stopDeadline, err := armConnection(operationCtx, connection)
+	if err != nil {
+		client.failConnect(ErrorTransport)
+		return newError("connect.deadline", ErrorTransport, SessionUnchanged, err)
+	}
+	defer stopDeadline()
+
+	offeredTPDU, err := isotcp.TPDUSizeForS7PDU(int(client.config.RequestedPDU))
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return invariantError("connect.cotp_limits", err)
+	}
+	connectionRequest, err := isotcp.BuildConnectionRequest(client.config.localTSAP, client.config.remoteTSAP, offeredTPDU)
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return invariantError("connect.cotp_encode", err)
+	}
+	if _, err = isotcp.WriteFull(connection, connectionRequest); err != nil {
+		failure := client.classifyContextError("connect.cotp_write", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	connectionConfirm, err := isotcp.ReadFrame(connection, client.config.MaxFrameBytes)
+	if err != nil {
+		failure := client.classifyContextError("connect.cotp_read", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	confirmResult, err := isotcp.ParseConnectionConfirm(connectionConfirm, client.config.localTSAP, client.config.remoteTSAP, offeredTPDU)
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.cotp_confirm", err)
+	}
+	tpduPayloadLimit := confirmResult.TPDUSize - isotcp.DataTPDUHeaderSize
+	if tpduPayloadLimit < minRequestedPDU {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.cotp_limits", errors.New("negotiated TPDU cannot carry the minimum S7 PDU"))
+	}
+	sessionRequestedPDU := smallerInt(int(client.config.RequestedPDU), tpduPayloadLimit)
+
+	setupReference := uint16(1)
+	setup, err := protocol.BuildSetupRequest(setupReference, maxAmQCaller, maxAmQCallee, uint16(sessionRequestedPDU))
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return invariantError("connect.setup_encode", err)
+	}
+	setupFrame, err := isotcp.WrapData(setup)
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return invariantError("connect.setup_frame", err)
+	}
+	if len(setupFrame)-isotcp.TPKTHeaderSize > confirmResult.TPDUSize {
+		client.failConnect(ErrorProtocol)
+		return invariantError("connect.setup_frame", errors.New("setup request exceeds negotiated TPDU"))
+	}
+	if _, err = isotcp.WriteFull(connection, setupFrame); err != nil {
+		failure := client.classifyContextError("connect.setup_write", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	responseFrame, err := isotcp.ReadFrame(connection, client.config.MaxFrameBytes)
+	if err != nil {
+		failure := client.classifyContextError("connect.setup_read", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	if len(responseFrame)-isotcp.TPKTHeaderSize > confirmResult.TPDUSize {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.setup_frame", errors.New("setup response exceeds negotiated TPDU"))
+	}
+	responsePayload, err := isotcp.UnwrapData(responseFrame)
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.setup_cotp", err)
+	}
+	if len(responsePayload) > sessionRequestedPDU {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.setup_frame", errors.New("setup response exceeds requested S7 PDU"))
+	}
+	setupResult, err := protocol.ParseSetupResponse(responsePayload, setupReference)
+	if err != nil {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.setup_decode", err)
+	}
+	if setupResult.GlobalCode != 0 {
+		client.failConnect(ErrorPLC)
+		return plcError("connect.setup", setupResult.GlobalCode)
+	}
+	if err := operationCtx.Err(); err != nil {
+		failure := client.classifyContextError("connect", operationCtx, SessionUnchanged, err)
+		client.failConnect(failure.Kind)
+		return failure
+	}
+	if setupResult.MaxAmQCaller == 0 || setupResult.MaxAmQCallee == 0 || setupResult.PDU == 0 ||
+		setupResult.PDU < minRequestedPDU ||
+		setupResult.MaxAmQCaller > maxAmQCaller || setupResult.MaxAmQCallee > maxAmQCallee ||
+		int(setupResult.PDU) > sessionRequestedPDU ||
+		int(setupResult.PDU)+isotcp.DataTPDUHeaderSize > confirmResult.TPDUSize ||
+		int(setupResult.PDU)+isotcp.DataHeaderSize > client.config.MaxFrameBytes {
+		client.failConnect(ErrorProtocol)
+		return protocolError("connect.setup_limits", errors.New("invalid negotiated limits"))
+	}
+
+	localAddress := connection.LocalAddr().String()
+	remoteAddress := connection.RemoteAddr().String()
+	now := time.Now()
+	client.mu.Lock()
+	if client.state == StateClosed || client.state == StateClosing {
+		client.mu.Unlock()
+		_ = connection.Close()
+		return newError("connect", ErrorClosed, SessionUnchanged, nil)
+	}
+	client.state = StateReady
+	client.reference = setupReference
+	client.sessionGeneration++
+	client.limits = SessionLimits{
+		RequestedPDU:           uint16(sessionRequestedPDU),
+		NegotiatedPDU:          setupResult.PDU,
+		NegotiatedTPDU:         uint16(confirmResult.TPDUSize),
+		NegotiatedMaxAmQCaller: setupResult.MaxAmQCaller,
+		NegotiatedMaxAmQCallee: setupResult.MaxAmQCallee,
+	}
+	client.limitsValid = true
+	client.localAddress = localAddress
+	client.remoteAddress = remoteAddress
+	client.lastActivity = now
+	client.lastSessionFailureKind = ""
+	client.mu.Unlock()
+	return nil
+}
+
+// Close is idempotent and terminal. It interrupts in-flight socket I/O and
+// causes queued callers to return ErrClosed.
+func (client *Client) Close() error {
+	if client == nil {
+		return nil
+	}
+	var closeErr error
+	client.closeOnce.Do(func() {
+		client.mu.Lock()
+		client.state = StateClosing
+		connection := client.conn
+		client.conn = nil
+		client.limitsValid = false
+		client.mu.Unlock()
+
+		if client.cancel != nil {
+			client.cancel()
+		}
+		if connection != nil {
+			closeErr = connection.Close()
+		}
+
+		client.mu.Lock()
+		client.state = StateClosed
+		client.mu.Unlock()
+	})
+	return closeErr
+}
+
+// State returns the local lifecycle state.
+func (client *Client) State() State {
+	if client == nil {
+		return StateClosed
+	}
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	return client.state
+}
+
+// Limits returns the active session limits only while the client is Ready.
+func (client *Client) Limits() (SessionLimits, bool) {
+	if client == nil {
+		return SessionLimits{}, false
+	}
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	if client.state != StateReady || !client.limitsValid {
+		return SessionLimits{}, false
+	}
+	return client.limits, true
+}
+
+// Diagnostics returns a local snapshot and never performs network I/O.
+func (client *Client) Diagnostics() Diagnostics {
+	if client == nil {
+		return Diagnostics{State: StateClosed}
+	}
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	return Diagnostics{
+		State:                  client.state,
+		SessionGeneration:      client.sessionGeneration,
+		Limits:                 client.limits,
+		LimitsValid:            client.state == StateReady && client.limitsValid,
+		LocalAddress:           client.localAddress,
+		RemoteAddress:          client.remoteAddress,
+		LastActivity:           client.lastActivity,
+		LastSessionFailureKind: client.lastSessionFailureKind,
+	}
+}
+
+// Read validates and executes a logical batch. Results always correspond to
+// input order. Per-item PLC errors are returned in ReadResult.Err.
+func (client *Client) Read(ctx context.Context, input []ReadItem) ([]ReadResult, error) {
+	if client == nil {
+		return nil, invalidError("read", "nil client")
+	}
+	if ctx == nil {
+		return nil, invalidError("read", "nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, client.classifyContextError("read", ctx, SessionUnchanged, err)
+	}
+	items, lengths, err := client.prepareReads(input)
+	if err != nil {
+		if len(input) > client.config.MaxItemsPerCall {
+			return nil, err
+		}
+		return makeReadFailureResults(len(input), err), err
+	}
+	if err := client.acquire(ctx); err != nil {
+		return makeReadFailureResults(len(items), err), err
+	}
+	defer client.release()
+	operationCtx, cleanup := client.operationContext(ctx, 0)
+	defer cleanup()
+	results, _, err := client.readLocked(operationCtx, items, lengths, nil)
+	return results, err
+}
+
+// Write validates and clones the complete logical batch before any I/O. A
+// single item is never split across PDUs.
+func (client *Client) Write(ctx context.Context, input []WriteItem) ([]WriteResult, error) {
+	if client == nil {
+		return nil, invalidError("write", "nil client")
+	}
+	if ctx == nil {
+		return nil, invalidError("write", "nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, client.classifyContextError("write", ctx, SessionUnchanged, err)
+	}
+	items, err := client.prepareWrites(input)
+	if err != nil {
+		if len(input) > client.config.MaxItemsPerCall {
+			return nil, err
+		}
+		return makeWriteFailureResults(len(input), err), err
+	}
+	if err := client.acquire(ctx); err != nil {
+		return makeWriteFailureResults(len(items), err), err
+	}
+	defer client.release()
+	operationCtx, cleanup := client.operationContext(ctx, 0)
+	defer cleanup()
+	return client.writeLocked(operationCtx, items, false)
+}
+
+// ReadArea reads a continuous byte range. n is the confirmed contiguous
+// prefix copied into dst when an error interrupts a multi-PDU operation.
+func (client *Client) ReadArea(ctx context.Context, area Area, dbNumber uint16, start uint32, dst []byte) (int, error) {
+	if client == nil {
+		return 0, invalidError("read_area", "nil client")
+	}
+	if ctx == nil {
+		return 0, invalidError("read_area", "nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, client.classifyContextError("read_area", ctx, SessionUnchanged, err)
+	}
+	if len(dst) == 0 {
+		return 0, invalidError("read_area", "destination must not be empty")
+	}
+	if len(dst) > client.config.MaxItemBytes || len(dst) > client.config.MaxBatchBytes || uint64(len(dst)) > math.MaxUint32 {
+		return 0, limitError("read_area", "destination exceeds configured or wire limits")
+	}
+	item := ReadItem{
+		Address:   Address{Area: area, DBNumber: dbNumber, Offset: start},
+		Transport: TransportByte,
+		Count:     uint32(len(dst)),
+	}
+	items, lengths, err := client.prepareReads([]ReadItem{item})
+	if err != nil {
+		return 0, err
+	}
+	if err := client.acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer client.release()
+	operationCtx, cleanup := client.operationContext(ctx, 0)
+	defer cleanup()
+	results, progress, err := client.readLocked(operationCtx, items, lengths, [][]byte{dst})
+	if err == nil && results[0].Err != nil {
+		err = results[0].Err
+	}
+	return progress[0], err
+}
+
+// WriteArea explicitly permits a continuous byte range to be split across
+// PDUs. n counts the contiguous prefix acknowledged by the PLC.
+func (client *Client) WriteArea(ctx context.Context, area Area, dbNumber uint16, start uint32, src []byte) (int, error) {
+	if client == nil {
+		return 0, invalidError("write_area", "nil client")
+	}
+	if ctx == nil {
+		return 0, invalidError("write_area", "nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, client.classifyContextError("write_area", ctx, SessionUnchanged, err)
+	}
+	if len(src) == 0 {
+		return 0, invalidError("write_area", "source must not be empty")
+	}
+	if len(src) > client.config.MaxBatchBytes {
+		return 0, limitError("write_area", "source exceeds max_batch_bytes")
+	}
+	if uint64(len(src)) > math.MaxUint32 {
+		return 0, limitError("write_area", "source exceeds the public count field")
+	}
+	if _, err := validateReadItem(ReadItem{
+		Address:   Address{Area: area, DBNumber: dbNumber, Offset: start},
+		Transport: TransportByte,
+		Count:     uint32(len(src)),
+	}, client.config.MaxBatchBytes); err != nil {
+		return 0, err
+	}
+	if err := client.acquire(ctx); err != nil {
+		return 0, err
+	}
+	defer client.release()
+	operationCtx, cleanup := client.operationContext(ctx, 0)
+	defer cleanup()
+	pdu, err := client.readyPDU("write_area")
+	if err != nil {
+		return 0, err
+	}
+	maxChunk := pdu - 28
+	if maxChunk > math.MaxUint16/8 {
+		maxChunk = math.MaxUint16 / 8
+	}
+	if maxChunk > client.config.MaxItemBytes {
+		maxChunk = client.config.MaxItemBytes
+	}
+	if maxChunk < 1 {
+		return 0, limitError("write_area", "negotiated PDU cannot carry a byte item")
+	}
+	itemCount := (len(src) + maxChunk - 1) / maxChunk
+	if itemCount > client.config.MaxFragmentsPerCall {
+		return 0, limitError("write_area", "chunk count exceeds max_fragments_per_call")
+	}
+	confirmed := 0
+	for offset := 0; offset < len(src); {
+		length := smallerInt(maxChunk, len(src)-offset)
+		prepared, err := client.prepareWrites([]WriteItem{{
+			Address:   Address{Area: area, DBNumber: dbNumber, Offset: start + uint32(offset)},
+			Transport: TransportByte,
+			Count:     uint32(length),
+			Data:      src[offset : offset+length],
+		}})
+		if err != nil {
+			return confirmed, err
+		}
+		results, fatalErr := client.writeLocked(operationCtx, prepared, true)
+		if len(results) != 1 {
+			return confirmed, invariantError("write_area", errors.New("single chunk returned an invalid result count"))
+		}
+		if results[0].Outcome != WriteAcknowledged {
+			if fatalErr != nil {
+				return confirmed, fatalErr
+			}
+			if results[0].Err != nil {
+				return confirmed, results[0].Err
+			}
+			return confirmed, invariantError("write_area", errors.New("single chunk was not acknowledged"))
+		}
+		if fatalErr != nil {
+			return confirmed, fatalErr
+		}
+		confirmed += length
+		offset += length
+	}
+	return confirmed, nil
+}
+
+type readFragment struct {
+	original int
+	offset   int
+	item     protocol.Item
+}
+
+type preparedWrite struct {
+	original int
+	item     protocol.WriteItem
+}
+
+func (client *Client) prepareReads(input []ReadItem) ([]ReadItem, []int, error) {
+	if len(input) == 0 {
+		return nil, nil, invalidError("read", "items must not be empty")
+	}
+	if len(input) > client.config.MaxItemsPerCall {
+		return nil, nil, limitError("read", "item count exceeds max_items_per_call")
+	}
+	items := append([]ReadItem(nil), input...)
+	lengths := make([]int, len(items))
+	total := uint64(0)
+	for index, item := range items {
+		length, err := validateReadItem(item, client.config.MaxItemBytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read item %d: %w", index, err)
+		}
+		lengths[index] = length
+		total += uint64(length)
+		if total > uint64(client.config.MaxBatchBytes) {
+			return nil, nil, limitError("read", "batch exceeds max_batch_bytes")
+		}
+	}
+	return items, lengths, nil
+}
+
+func (client *Client) prepareWrites(input []WriteItem) ([]WriteItem, error) {
+	if len(input) == 0 {
+		return nil, invalidError("write", "items must not be empty")
+	}
+	if len(input) > client.config.MaxItemsPerCall {
+		return nil, limitError("write", "item count exceeds max_items_per_call")
+	}
+	total := uint64(0)
+	for index, item := range input {
+		length, err := validateWriteItem(item, client.config.MaxItemBytes)
+		if err != nil {
+			return nil, fmt.Errorf("write item %d: %w", index, err)
+		}
+		total += uint64(length)
+		if total > uint64(client.config.MaxBatchBytes) {
+			return nil, limitError("write", "batch exceeds max_batch_bytes")
+		}
+	}
+	items := make([]WriteItem, len(input))
+	for index, item := range input {
+		items[index] = item
+		items[index].Data = append([]byte(nil), item.Data...)
+	}
+	return items, nil
+}
+
+func (client *Client) readLocked(ctx context.Context, items []ReadItem, lengths []int, destinations [][]byte) ([]ReadResult, []int, error) {
+	results := make([]ReadResult, len(items))
+	progress := make([]int, len(items))
+	pdu, err := client.readyPDU("read")
+	if err != nil {
+		markReadIncomplete(results, progress, lengths, err)
+		return results, progress, err
+	}
+	fragmentCount, err := countReadFragments(items, lengths, pdu)
+	if err != nil {
+		markReadIncomplete(results, progress, lengths, err)
+		return results, progress, err
+	}
+	if fragmentCount > client.config.MaxFragmentsPerCall {
+		err = limitError("read", "fragment count exceeds max_fragments_per_call")
+		markReadIncomplete(results, progress, lengths, err)
+		return results, progress, err
+	}
+	if err := ctx.Err(); err != nil {
+		failure := client.classifyContextError("read", ctx, SessionUnchanged, err)
+		markReadIncomplete(results, progress, lengths, failure)
+		return results, progress, failure
+	}
+	if destinations != nil && len(destinations) != len(items) {
+		err = invariantError("read.destination", errors.New("destination count does not match item count"))
+		markReadIncomplete(results, progress, lengths, err)
+		return results, progress, err
+	}
+	for index, length := range lengths {
+		if destinations == nil {
+			results[index].Data = make([]byte, length)
+			continue
+		}
+		if len(destinations[index]) != length {
+			err = invariantError("read.destination", fmt.Errorf("destination %d length mismatch", index))
+			markReadIncomplete(results, progress, lengths, err)
+			return results, progress, err
+		}
+		results[index].Data = destinations[index]
+	}
+	iterator := readFragmentIterator{items: items, lengths: lengths, pdu: pdu}
+	for {
+		batch, ok, batchErr := nextReadBatch(&iterator, pdu, results)
+		if batchErr != nil {
+			markReadIncomplete(results, progress, lengths, batchErr)
+			return results, progress, batchErr
+		}
+		if !ok {
 			break
-		case 2:
-		case 3:
-			s7Error.High = response.Data[10]
-			s7Error.Low = response.Data[11]
+		}
+		if err := ctx.Err(); err != nil {
+			failure := client.classifyContextError("read", ctx, SessionUnchanged, err)
+			markReadIncomplete(results, progress, lengths, failure)
+			return results, progress, failure
+		}
+		wireItems := make([]protocol.Item, len(batch))
+		for index := range batch {
+			wireItems[index] = batch[index].item
+		}
+		reference := client.nextReference()
+		request, err := protocol.BuildReadRequest(reference, wireItems)
+		if err != nil {
+			failure := invariantError("read.encode", err)
+			markReadIncomplete(results, progress, lengths, failure)
+			return results, progress, failure
+		}
+		payload, _, err := client.exchange(ctx, "read", request)
+		if err != nil {
+			markReadIncomplete(results, progress, lengths, err)
+			return results, progress, err
+		}
+		wireResults, globalCode, err := protocol.ParseReadResponse(payload, reference, wireItems)
+		if err != nil {
+			client.breakSession(ErrorProtocol)
+			failure := protocolError("read.decode", err)
+			markReadIncomplete(results, progress, lengths, failure)
+			return results, progress, failure
+		}
+		if globalCode != 0 {
+			failure := plcError("read", globalCode)
+			for _, fragment := range batch {
+				if results[fragment.original].Err == nil {
+					results[fragment.original].Err = failure
+				}
+			}
+			markReadIncomplete(results, progress, lengths, failure)
+			return results, progress, failure
+		}
+		for index, wireResult := range wireResults {
+			fragment := batch[index]
+			result := &results[fragment.original]
+			if wireResult.ReturnCode != 0xff {
+				if result.Err == nil {
+					result.Err = plcItemError("read.item", wireResult.ReturnCode)
+				}
+				continue
+			}
+			if result.Err != nil || fragment.offset != progress[fragment.original] {
+				continue
+			}
+			copy(result.Data[fragment.offset:], wireResult.Data)
+			progress[fragment.original] += len(wireResult.Data)
+		}
+	}
+	var incompleteErr error
+	for index := range results {
+		if results[index].Err != nil || progress[index] != lengths[index] {
+			if results[index].Err == nil {
+				if incompleteErr == nil {
+					incompleteErr = invariantError("read", errors.New("incomplete logical item"))
+				}
+				results[index].Err = incompleteErr
+			}
+			results[index].Data = results[index].Data[:progress[index]]
+		}
+	}
+	return results, progress, incompleteErr
+}
+
+func (client *Client) writeLocked(ctx context.Context, items []WriteItem, stopAfterFailure bool) ([]WriteResult, error) {
+	results := make([]WriteResult, len(items))
+	pdu, err := client.readyPDU("write")
+	if err != nil {
+		for index := range results {
+			results[index].Err = err
+		}
+		return results, err
+	}
+	if err := ctx.Err(); err != nil {
+		failure := client.classifyContextError("write", ctx, SessionUnchanged, err)
+		for index := range results {
+			results[index].Err = failure
+		}
+		return results, failure
+	}
+	prepared := make([]preparedWrite, len(items))
+	for index, item := range items {
+		wire, err := makeProtocolItem(item.Address, item.Transport, item.Count)
+		if err != nil {
+			failure := invariantError("write.item", err)
+			for resultIndex := range results {
+				results[resultIndex].Err = failure
+			}
+			return results, failure
+		}
+		prepared[index] = preparedWrite{
+			original: index,
+			item:     protocol.WriteItem{Item: wire, Data: item.Data},
+		}
+	}
+	// Preflight every item against the active session before the first write.
+	// Streaming batch planning must never discover a local size error only
+	// after earlier items have already changed PLC memory.
+	for _, item := range prepared {
+		if protocol.WriteRequestSize([]protocol.WriteItem{item.item}) > pdu || protocol.WriteResponseSize(1) > pdu {
+			failure := limitError("write", "one item exceeds negotiated PDU")
+			for index := range results {
+				results[index].Err = failure
+			}
+			return results, failure
+		}
+	}
+	for next := 0; next < len(prepared); {
+		batch, following, batchErr := nextWriteBatch(prepared, next, pdu, stopAfterFailure)
+		if batchErr != nil {
+			for index := range results {
+				if results[index].Err == nil {
+					results[index].Err = batchErr
+				}
+			}
+			return results, batchErr
+		}
+		next = following
+		if err := ctx.Err(); err != nil {
+			failure := client.classifyContextError("write", ctx, SessionUnchanged, err)
+			markUnattemptedWrites(results, failure)
+			return results, failure
+		}
+		wireItems := make([]protocol.WriteItem, len(batch))
+		for index := range batch {
+			wireItems[index] = batch[index].item
+		}
+		reference := client.nextReference()
+		request, err := protocol.BuildWriteRequest(reference, wireItems)
+		if err != nil {
+			failure := invariantError("write.encode", err)
+			for _, item := range batch {
+				results[item.original].Err = failure
+			}
+			markUnattemptedWrites(results, failure)
+			return results, failure
+		}
+		payload, sent, err := client.exchange(ctx, "write", request)
+		if err != nil {
+			for _, item := range batch {
+				result := &results[item.original]
+				if sent {
+					result.Outcome = WriteUnknown
+				} else {
+					result.Outcome = WriteNotAttempted
+				}
+				result.Err = err
+			}
+			markUnattemptedWrites(results, err)
+			return results, err
+		}
+		returnCodes, globalCode, err := protocol.ParseWriteResponse(payload, reference, len(batch))
+		if err != nil {
+			client.breakSession(ErrorProtocol)
+			failure := protocolError("write.decode", err)
+			for _, item := range batch {
+				results[item.original] = WriteResult{Outcome: WriteUnknown, Err: failure}
+			}
+			markUnattemptedWrites(results, failure)
+			return results, failure
+		}
+		if globalCode != 0 {
+			failure := plcError("write", globalCode)
+			for _, item := range batch {
+				results[item.original] = WriteResult{Outcome: WriteRejected, Err: failure}
+			}
+			markUnattemptedWrites(results, failure)
+			return results, failure
+		}
+		batchFailed := false
+		for index, returnCode := range returnCodes {
+			original := batch[index].original
+			if returnCode == 0xff {
+				results[original] = WriteResult{Outcome: WriteAcknowledged}
+			} else {
+				batchFailed = true
+				results[original] = WriteResult{
+					Outcome: WriteRejected,
+					Err:     plcItemError("write.item", returnCode),
+				}
+			}
+		}
+		if stopAfterFailure && batchFailed {
+			failure := firstWriteError(results)
+			markUnattemptedWrites(results, failure)
+			return results, failure
+		}
+	}
+	return results, nil
+}
+
+func maxReadFragmentData(transport TransportType, pdu int) (int, error) {
+	if pdu < protocol.ReadRequestSize(1) || pdu < protocol.ReadResponseSize([]protocol.Item{{DataBytes: 1}}) {
+		return 0, limitError("read", "negotiated PDU is too small")
+	}
+	layout, ok := layoutFor(transport)
+	if !ok {
+		return 0, invariantError("read.fragment", errors.New("unsupported transport"))
+	}
+	maxData := pdu - 18
+	if layout.lengthInBits && maxData > math.MaxUint16/8 {
+		maxData = math.MaxUint16 / 8
+	}
+	if !layout.lengthInBits && maxData > math.MaxUint16 {
+		maxData = math.MaxUint16
+	}
+	maxData -= maxData % int(layout.width)
+	if maxData < int(layout.width) {
+		return 0, limitError("read", "negotiated PDU cannot carry an item element")
+	}
+	if transport == TransportBit {
+		return 1, nil
+	}
+	return maxData, nil
+}
+
+func countReadFragments(items []ReadItem, lengths []int, pdu int) (int, error) {
+	if len(items) != len(lengths) {
+		return 0, invariantError("read.fragment", errors.New("item and length counts differ"))
+	}
+	total := uint64(0)
+	for index, item := range items {
+		maxData, err := maxReadFragmentData(item.Transport, pdu)
+		if err != nil {
+			return 0, err
+		}
+		total += uint64((lengths[index] + maxData - 1) / maxData)
+		if total > uint64(math.MaxInt) {
+			return 0, limitError("read", "fragment count overflows int")
+		}
+	}
+	return int(total), nil
+}
+
+type readFragmentIterator struct {
+	items      []ReadItem
+	lengths    []int
+	pdu        int
+	original   int
+	offset     int
+	pending    readFragment
+	hasPending bool
+}
+
+func (iterator *readFragmentIterator) next() (readFragment, bool, error) {
+	if iterator.hasPending {
+		iterator.hasPending = false
+		return iterator.pending, true, nil
+	}
+	for iterator.original < len(iterator.items) {
+		if iterator.offset >= iterator.lengths[iterator.original] {
+			iterator.original++
+			iterator.offset = 0
+			continue
+		}
+		item := iterator.items[iterator.original]
+		layout, ok := layoutFor(item.Transport)
+		if !ok {
+			return readFragment{}, false, invariantError("read.fragment", errors.New("unsupported transport"))
+		}
+		maxData, err := maxReadFragmentData(item.Transport, iterator.pdu)
+		if err != nil {
+			return readFragment{}, false, err
+		}
+		length := smallerInt(maxData, iterator.lengths[iterator.original]-iterator.offset)
+		count := uint32(length) / layout.width
+		fragmentAddress := item.Address
+		if item.Address.Area == AreaTimer || item.Address.Area == AreaCounter {
+			fragmentAddress.Offset += uint32(iterator.offset) / layout.width
+		} else if item.Transport != TransportBit {
+			fragmentAddress.Offset += uint32(iterator.offset)
+		}
+		wire, err := makeProtocolItem(fragmentAddress, item.Transport, count)
+		if err != nil {
+			return readFragment{}, false, invariantError("read.fragment", err)
+		}
+		fragment := readFragment{original: iterator.original, offset: iterator.offset, item: wire}
+		iterator.offset += length
+		return fragment, true, nil
+	}
+	return readFragment{}, false, nil
+}
+
+func (iterator *readFragmentIterator) putBack(fragment readFragment) {
+	iterator.pending = fragment
+	iterator.hasPending = true
+}
+
+func nextReadBatch(iterator *readFragmentIterator, pdu int, results []ReadResult) ([]readFragment, bool, error) {
+	current := make([]readFragment, 0, protocol.CompatibilityMaxItemsPerPDU)
+	requestSize := 12
+	responseSize := 14
+	for {
+		fragment, ok, err := iterator.next()
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return current, len(current) > 0, nil
+		}
+		if results[fragment.original].Err != nil {
+			continue
+		}
+		candidateRequest := requestSize + 12
+		candidateResponse := responseSize + 4 + fragment.item.DataBytes
+		if len(current) > 0 && current[len(current)-1].item.DataBytes%2 != 0 {
+			candidateResponse++
+		}
+		if len(current) == protocol.CompatibilityMaxItemsPerPDU || candidateRequest > pdu || candidateResponse > pdu {
+			if len(current) == 0 {
+				return nil, false, limitError("read", "one fragment exceeds negotiated PDU")
+			}
+			iterator.putBack(fragment)
+			return current, true, nil
+		}
+		current = append(current, fragment)
+		requestSize = candidateRequest
+		responseSize = candidateResponse
+	}
+}
+
+func nextWriteBatch(items []preparedWrite, start, pdu int, single bool) ([]preparedWrite, int, error) {
+	if start < 0 || start >= len(items) {
+		return nil, start, invariantError("write.plan", errors.New("batch start is outside item range"))
+	}
+	requestSize := 12
+	responseSize := 14
+	end := start
+	for end < len(items) {
+		item := items[end]
+		candidateRequest := requestSize + 12 + 4 + len(item.item.Data)
+		if end > start && len(items[end-1].item.Data)%2 != 0 {
+			candidateRequest++
+		}
+		candidateResponse := responseSize + 1
+		if end-start == protocol.CompatibilityMaxItemsPerPDU || candidateRequest > pdu || candidateResponse > pdu {
+			if end == start {
+				return nil, start, limitError("write", "one item exceeds negotiated PDU")
+			}
 			break
+		}
+		requestSize = candidateRequest
+		responseSize = candidateResponse
+		end++
+		if single {
+			break
+		}
+	}
+	return items[start:end], end, nil
+}
+
+func makeProtocolItem(address Address, transport TransportType, count uint32) (protocol.Item, error) {
+	if count == 0 || count > math.MaxUint16 {
+		return protocol.Item{}, fmt.Errorf("count exceeds one wire descriptor")
+	}
+	layout, ok := layoutFor(transport)
+	if !ok {
+		return protocol.Item{}, fmt.Errorf("unsupported transport")
+	}
+	dataBytes64 := uint64(count) * uint64(layout.width)
+	if dataBytes64 > math.MaxInt {
+		return protocol.Item{}, fmt.Errorf("data length overflow")
+	}
+	area, ok := wireArea(address.Area)
+	if !ok {
+		return protocol.Item{}, fmt.Errorf("unsupported area")
+	}
+	wireAddress := address.Offset
+	if address.Area != AreaTimer && address.Area != AreaCounter {
+		wireAddress = address.Offset*8 + uint32(address.Bit)
+	}
+	return protocol.Item{
+		WordLength:        layout.wordLength,
+		ResponseTransport: layout.responseTransport,
+		Amount:            uint16(count),
+		DBNumber:          address.DBNumber,
+		Area:              area,
+		Address:           wireAddress,
+		DataBytes:         int(dataBytes64),
+		LengthInBits:      layout.lengthInBits,
+	}, nil
+}
+
+func wireArea(area Area) (byte, bool) {
+	switch area {
+	case AreaInput:
+		return 0x81, true
+	case AreaOutput:
+		return 0x82, true
+	case AreaMarker:
+		return 0x83, true
+	case AreaDB:
+		return 0x84, true
+	case AreaCounter:
+		return 0x1c, true
+	case AreaTimer:
+		return 0x1d, true
+	default:
+		return 0, false
+	}
+}
+
+func (client *Client) exchange(ctx context.Context, operation string, request []byte) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, client.classifyContextError(operation, ctx, SessionUnchanged, err)
+	}
+	exchangeCtx := ctx
+	cancelExchange := func() {}
+	if client.config.ExchangeTimeout > 0 {
+		exchangeCtx, cancelExchange = context.WithTimeout(ctx, client.config.ExchangeTimeout)
+	}
+	defer cancelExchange()
+	client.mu.RLock()
+	connection := client.conn
+	state := client.state
+	limits := client.limits
+	limitsValid := client.limitsValid
+	client.mu.RUnlock()
+	if state != StateReady || connection == nil || !limitsValid {
+		return nil, false, client.stateError(operation, state)
+	}
+	if len(request) > int(limits.NegotiatedPDU) {
+		return nil, false, invariantError(operation+".pdu", errors.New("request exceeds negotiated S7 PDU"))
+	}
+	frame, err := isotcp.WrapData(request)
+	if err != nil {
+		return nil, false, invariantError(operation+".frame", err)
+	}
+	if len(frame)-isotcp.TPKTHeaderSize > int(limits.NegotiatedTPDU) {
+		return nil, false, invariantError(operation+".frame", errors.New("request exceeds negotiated TPDU"))
+	}
+	stopDeadline, err := armConnection(exchangeCtx, connection)
+	if err != nil {
+		client.breakSession(ErrorTransport)
+		return nil, false, newError(operation+".deadline", ErrorTransport, SessionBroken, err)
+	}
+	defer stopDeadline()
+	written, err := isotcp.WriteFull(connection, frame)
+	if err != nil {
+		failure := client.classifyContextError(operation+".write", exchangeCtx, SessionBroken, err)
+		client.breakSession(failure.Kind)
+		return nil, written > 0, failure
+	}
+	responseFrame, err := isotcp.ReadFrame(connection, client.config.MaxFrameBytes)
+	if err != nil {
+		failure := client.classifyContextError(operation+".read", exchangeCtx, SessionBroken, err)
+		client.breakSession(failure.Kind)
+		return nil, true, failure
+	}
+	if len(responseFrame)-isotcp.TPKTHeaderSize > int(limits.NegotiatedTPDU) {
+		client.breakSession(ErrorProtocol)
+		return nil, true, protocolError(operation+".frame", errors.New("response exceeds negotiated TPDU"))
+	}
+	payload, err := isotcp.UnwrapData(responseFrame)
+	if err != nil {
+		client.breakSession(ErrorProtocol)
+		return nil, true, protocolError(operation+".cotp", err)
+	}
+	if len(payload) > int(limits.NegotiatedPDU) {
+		client.breakSession(ErrorProtocol)
+		return nil, true, protocolError(operation+".pdu", errors.New("response exceeds negotiated S7 PDU"))
+	}
+	client.mu.Lock()
+	client.lastActivity = time.Now()
+	client.mu.Unlock()
+	return payload, true, nil
+}
+
+func (client *Client) readyPDU(operation string) (int, error) {
+	client.mu.RLock()
+	defer client.mu.RUnlock()
+	if client.state != StateReady || client.conn == nil || !client.limitsValid {
+		return 0, client.stateError(operation, client.state)
+	}
+	return int(client.limits.NegotiatedPDU), nil
+}
+
+func (client *Client) nextReference() uint16 {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.reference++
+	if client.reference == 0 {
+		client.reference = 1
+	}
+	return client.reference
+}
+
+func (client *Client) acquire(ctx context.Context) error {
+	if client.gate == nil || client.lifeCtx == nil {
+		return invalidError("session.queue", "client must be created with New")
+	}
+	select {
+	case <-ctx.Done():
+		return client.classifyContextError("session.queue", ctx, SessionUnchanged, ctx.Err())
+	case <-client.lifeCtx.Done():
+		return newError("session.queue", ErrorClosed, SessionUnchanged, nil)
+	case client.gate <- struct{}{}:
+		select {
+		case <-client.lifeCtx.Done():
+			client.release()
+			return newError("session.queue", ErrorClosed, SessionUnchanged, nil)
 		default:
 			return nil
 		}
 	}
-	return s7Error
 }
 
-// dataSize to number of byte accordingly
-func dataSizeByte(wordLength int) int {
-	switch wordLength {
-	case s7wlbit:
-		return 1
-	case s7wlbyte:
-		return 1
-	case s7wlChar:
-		return 1
-	case s7wlword:
-		return 2
-	case s7wlint:
-		return 2
-	case s7wlcounter:
-		return 2
-	case s7wltimer:
-		return 2
-	case s7wldword:
-		return 4
-	case s7wldint:
-		return 4
-	case s7wlreal:
-		return 4
-	default:
-		return 0
-	}
-
+func (client *Client) release() {
+	<-client.gate
 }
 
-// read generic area, pass result into a buffer
-func (mb *client) readNckArea(addrItem *[]S7NckAddrItem, respItems *[]S7NckDataItem) (err error) {
-	addrCnt := len(*addrItem)
-	if addrCnt == 0 {
-		return fmt.Errorf("read NckArea Must Give DataItem")
+func (client *Client) operationContext(parent context.Context, timeout time.Duration) (context.Context, func()) {
+	base, cancelBase := contextWithShutdown(parent, client.lifeCtx)
+	ctx := base
+	cancelTimeout := func() {}
+	if timeout > 0 {
+		ctx, cancelTimeout = context.WithTimeout(base, timeout)
 	}
-	sizeProtocolBuf := sizeNckHeaderRead + addrCnt*10
-	requestData := make([]byte, sizeProtocolBuf)
-	copy(requestData[0:], s7NckReadWriteTelegram[0:])
-	request := NewProtocolDataUnit(requestData)
-	// 写协议的数据长度信息
-	binary.BigEndian.PutUint16(request.Data[2:], uint16(sizeProtocolBuf))
-	request.Data[18] = byte(addrCnt)
-	// 参数长度
-	paraLen := addrCnt*10 + 2
-	binary.BigEndian.PutUint16(request.Data[13:], uint16(paraLen))
-
-	// 写协议地址信息
-	for i, item := range *addrItem {
-		offset := 19 + i*10
-		request.Data[offset] = 0x12   // variable specification
-		request.Data[offset+1] = 0x08 // Length of the following address specification
-		request.Data[offset+2] = 0x82 // SyntaxId NCK = 0x82
-		request.Data[offset+3] = combineToByte(item.Area, item.Unit)
-		binary.BigEndian.PutUint16(request.Data[offset+4:], uint16(item.Column))
-		binary.BigEndian.PutUint16(request.Data[offset+6:], uint16(item.Line))
-		request.Data[offset+8] = byte(item.Module)
-		request.Data[offset+9] = 1 // LINE COUNT
+	return ctx, func() {
+		cancelTimeout()
+		cancelBase()
 	}
-	var response *ProtocolDataUnit
-	response, sendError := mb.send(&request)
-	err = sendError
+}
 
-	if err == nil {
-		if size := len(response.Data); size < 25 {
-			err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", len(response.Data))
-		} else {
-			fmt.Printf("response data: %v\n", response.Data)
-			//copy response to buffer
-			err := ParseS7NckRespItems(response.Data[21:], respItems)
-			if err != nil {
-				fmt.Println(err)
-			}
+// contextWithShutdown derives from parent and is also canceled by shutdown.
+// The watcher always exits when the returned cancel function is called.
+func contextWithShutdown(parent, shutdown context.Context) (context.Context, context.CancelFunc) {
+	if shutdown == nil {
+		return context.WithCancel(parent)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		select {
+		case <-shutdown.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+func armConnection(ctx context.Context, connection net.Conn) (func(), error) {
+	deadline := time.Time{}
+	if value, ok := ctx.Deadline(); ok {
+		deadline = value
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		select {
+		case <-ctx.Done():
+			_ = connection.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return func() {
+		close(stop)
+		<-stopped
+		_ = connection.SetDeadline(time.Time{})
+	}, nil
+}
+
+func (client *Client) classifyContextError(operation string, ctx context.Context, impact SessionImpact, cause error) *Error {
+	if client.State() == StateClosed || client.lifeCtx != nil && errors.Is(client.lifeCtx.Err(), context.Canceled) {
+		return newError(operation, ErrorClosed, impact, cause)
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded) {
+		return &Error{Op: operation, Kind: ErrorTimeout, Temporary: true, Impact: impact, Cause: cause}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(cause, context.Canceled) {
+		return newError(operation, ErrorCanceled, impact, cause)
+	}
+	var networkError net.Error
+	if errors.As(cause, &networkError) && networkError.Timeout() {
+		return &Error{Op: operation, Kind: ErrorTimeout, Temporary: true, Impact: impact, Cause: cause}
+	}
+	return &Error{Op: operation, Kind: ErrorTransport, Temporary: true, Impact: impact, Cause: cause}
+}
+
+func (client *Client) stateError(operation string, state State) *Error {
+	if state == StateClosed || state == StateClosing {
+		return newError(operation, ErrorClosed, SessionUnchanged, nil)
+	}
+	return newError(operation, ErrorNotConnected, SessionUnchanged, nil)
+}
+
+func (client *Client) failConnect(kind ErrorKind) {
+	client.mu.Lock()
+	connection := client.conn
+	client.conn = nil
+	client.limitsValid = false
+	if client.state != StateClosed && client.state != StateClosing {
+		client.lastSessionFailureKind = kind
+		client.state = StateDisconnected
+	}
+	client.mu.Unlock()
+	if connection != nil {
+		_ = connection.Close()
+	}
+}
+
+func (client *Client) breakSession(kind ErrorKind) {
+	client.mu.Lock()
+	connection := client.conn
+	client.conn = nil
+	client.limitsValid = false
+	if client.state != StateClosed && client.state != StateClosing {
+		client.lastSessionFailureKind = kind
+		client.state = StateBroken
+	}
+	client.mu.Unlock()
+	if connection != nil {
+		_ = connection.Close()
+	}
+}
+
+func smallerInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func makeReadFailureResults(count int, err error) []ReadResult {
+	results := make([]ReadResult, count)
+	for index := range results {
+		results[index].Err = err
+	}
+	return results
+}
+
+func markReadIncomplete(results []ReadResult, progress, lengths []int, err error) {
+	for index := range results {
+		if results[index].Err == nil && index < len(progress) && index < len(lengths) && progress[index] < lengths[index] {
+			results[index].Err = err
+		}
+		if index < len(progress) && progress[index] <= len(results[index].Data) {
+			results[index].Data = results[index].Data[:progress[index]]
 		}
 	}
-	return
 }
 
-// 解析[]byte为[]S7NckDataItem
-func ParseS7NckRespItems(data []byte, items *[]S7NckDataItem) error {
-	offset := 0
-	for offset < len(data) {
-		// 检查是否有足够的数据
-		if offset+4 > len(data) {
-			return fmt.Errorf("invalid data length")
+func makeWriteFailureResults(count int, err error) []WriteResult {
+	results := make([]WriteResult, count)
+	for index := range results {
+		results[index] = WriteResult{Outcome: WriteNotAttempted, Err: err}
+	}
+	return results
+}
+
+func markUnattemptedWrites(results []WriteResult, err error) {
+	for index := range results {
+		if results[index].Outcome == WriteNotAttempted && results[index].Err == nil {
+			results[index].Err = err
 		}
+	}
+}
 
-		// 解析ReturnCode, TransportSize
-		returnCode := int(data[offset])
-		transportSize := int(data[offset+1])
-
-		// 解析Length (Length是2个字节，需要大端序)
-		length := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
-		offset += 4
-
-		// 解析Data
-		var respData []byte
-		if length > 0 {
-			if offset+length > len(data) {
-				return fmt.Errorf("invalid length for data section")
-			}
-			respData = data[offset : offset+length]
-			offset += length
-		} else {
-			respData = nil
+func firstWriteError(results []WriteResult) error {
+	for _, result := range results {
+		if result.Err != nil {
+			return result.Err
 		}
-
-		// 添加解析结果到items
-		item := S7NckDataItem{
-			ReturnCode:    returnCode,
-			TransportSize: transportSize,
-			Length:        length,
-			Data:          respData,
-		}
-		*items = append(*items, item)
 	}
-
-	return nil
-}
-
-func hexStringToBytes(hex string) ([]byte, error) {
-	hexLen := len(hex)
-	if hexLen%2 != 0 {
-		return nil, fmt.Errorf("hex string length is not even")
-	}
-
-	byteLen := hexLen / 2
-	bytesArr := make([]byte, byteLen)
-
-	for i := 0; i < byteLen; i++ {
-		var value uint64
-		var err error
-		value, err = strconv.ParseUint(hex[i*2:i*2+2], 16, 8)
-		if err != nil {
-			return nil, err
-		}
-		// Convert the uint64 value to uint8
-		bytesArr[i] = uint8(value)
-	}
-
-	return bytesArr, nil
-}
-func combineToByte(area int, unit int) byte {
-	// 检查输入是否有效
-	if area < 0 || area > 7 || unit < 0 || unit > 31 {
-		panic("Invalid input values")
-	}
-
-	// 组合高三位和低五位
-	combined := (byte(area) << 5) | byte(unit)
-
-	return combined
-}
-
-// writeArea write generic area into PLC with following parameters:
-// 1.area: s7areape/s7areapa/s7areamk/s7areadb/s7areact/s7areatm
-// 2.dbnumber: specify dbnumber, to use in write DB area, otherwise = 0
-// 3.start: start of the address
-// 4.amount: amount of the address
-// 5.wordlen: bit/byte/word/dword/real/counter/timer
-// 6.buffer: a byte array input for writing
-func (mb *client) writeNckArea(addrItems *[]S7NckAddrItem, dataItems *[]S7NckDataItem) (returnCodes []byte, err error) {
-	// Setup the telegram
-	addrCnt := len(*addrItems)
-	dataCnt := len(*dataItems)
-	if addrCnt == 0 || dataCnt == 0 || addrCnt != dataCnt {
-		return nil, fmt.Errorf("addrItems size must equal dataItems size and not equal zero")
-	}
-	nckDataLen := calcNckDataLen(dataItems)
-	buffLen := sizeNckHeaderWrite + addrCnt*10 + nckDataLen
-	requestData := make([]byte, buffLen)
-	copy(requestData[0:], s7NckReadWriteTelegram[0:])
-
-	request := NewProtocolDataUnit(requestData)
-	// 填写TPKT数据长度
-	binary.BigEndian.PutUint16(requestData[2:], uint16(buffLen))
-	// 填写S7 参数长度
-	binary.BigEndian.PutUint16(requestData[13:], uint16(addrCnt*10+2))
-	// 填写S7 数据长度
-	binary.BigEndian.PutUint16(requestData[15:], uint16(nckDataLen))
-	// 写参数是  为5
-	requestData[17] = s7WriteVarFunction
-	// addr item个数
-	requestData[18] = byte(addrCnt)
-
-	// 写协议地址信息
-	for i, item := range *addrItems {
-		offset := 19 + i*10
-		request.Data[offset] = 0x12   // variable specification
-		request.Data[offset+1] = 0x08 // Length of the following address specification
-		request.Data[offset+2] = 0x82 // SyntaxId NCK = 0x82
-		request.Data[offset+3] = combineToByte(item.Area, item.Unit)
-		binary.BigEndian.PutUint16(request.Data[offset+4:], uint16(item.Column))
-		binary.BigEndian.PutUint16(request.Data[offset+6:], uint16(item.Line))
-		request.Data[offset+8] = byte(item.Module)
-		request.Data[offset+9] = 1 // LINE COUNT
-	}
-	// 写数据
-	dataBuff, _ := conNckDataItems(dataItems)
-	//expand values into array
-	addrOffset := 19 + addrCnt*10
-	request.Data = append(request.Data[:addrOffset], dataBuff[:]...)
-	response, sendError := mb.send(&request)
-	err = sendError
-	if err == nil {
-		if length := len(response.Data); length == 21+addrCnt {
-			return response.Data[21:], nil
-		} else {
-			err = fmt.Errorf(ErrorText(errIsoInvalidPDU))
-		}
-
-	}
-
-	return
-}
-
-func calcNckDataLen(items *[]S7NckDataItem) int {
-	totalLength := 0
-
-	for _, item := range *items {
-		// 每个 ReturnCode 占 1 字节
-		// 每个 TransportSize 占 1 字节
-		// 每个 Length 占 2 字节
-		// Data 的长度由 Length 字段决定
-		itemLength := 1 + 1 + 2 + item.Length
-		totalLength += itemLength
-	}
-
-	return totalLength
-}
-
-func conNckDataItems(dataItems *[]S7NckDataItem) ([]byte, error) {
-	var buffer bytes.Buffer
-	for _, item := range *dataItems {
-		buffer.WriteByte(0x00) // ReturnCode为保留字，固定为0x00
-		buffer.WriteByte(0x09) // TransportSize为0x09时表示
-		lengthBytes := make([]byte, 2)
-		binary.BigEndian.PutUint16(lengthBytes, uint16(item.Length))
-		buffer.Write(lengthBytes)
-		// 将 Data 写入 buffer
-		buffer.Write(item.Data)
-	}
-	// 返回拼接的结果
-	return buffer.Bytes(), nil
+	return newError("write_area", ErrorPLC, SessionUnchanged, nil)
 }

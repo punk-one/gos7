@@ -1,0 +1,8 @@
+# Local packet captures.
+*.pcap
+*.pcapng
+
+# Go build and coverage output.
+/bin/
+/dist/
+coverage.out

@@ -1,0 +1,14 @@
+{
+  "endpoint": "192.0.2.10:102",
+  "routing": "rack-slot",
+  "rack": 0,
+  "slot": 2,
+  "role": "pg",
+  "connectTimeoutMillis": 5000,
+  "exchangeTimeoutMillis": 2000,
+  "reads": [
+    {"name": "temperature", "address": "DB1.DBD0", "transport": "real"},
+    {"name": "energy-lreal", "address": "DB1.DBD4", "transport": "byte", "count": 8},
+    {"name": "running", "address": "DB1.DBX12.0", "transport": "bit"}
+  ]
+}
