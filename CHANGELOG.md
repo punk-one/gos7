@@ -3,6 +3,15 @@
 This project follows semantic versioning after `v1.0.0`. The `v0.x` API may
 change while protocol and hardware evidence accumulates.
 
+## v0.1.1 — 2026-09-16
+
+### Fixed
+
+- Accept COTP connection-confirm TSAP parameters in either the ISO-standard
+  reversed order or the legacy request-echo order observed on some PLCs and
+  communication processors. Both values must still match the requested pair;
+  unrelated and partially mismatched TSAP responses remain rejected.
+
 ## v0.1.0 — 2026-08-21
 
 First release of the redesigned `github.com/punk-one/gos7` module.

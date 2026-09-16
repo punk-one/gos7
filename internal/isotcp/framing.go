@@ -150,6 +150,7 @@ func ParseConnectionConfirm(frame []byte, localTSAP, remoteTSAP uint16, offeredT
 		return ConnectionConfirm{}, fmt.Errorf("isotcp: unsupported COTP class")
 	}
 	result := ConnectionConfirm{TPDUSize: offeredTPDU}
+	var sourceTSAP, destinationTSAP *uint16
 	for offset := 11; offset < len(frame); {
 		if len(frame)-offset < 2 {
 			return ConnectionConfirm{}, fmt.Errorf("isotcp: truncated COTP parameter")
@@ -174,15 +175,33 @@ func ParseConnectionConfirm(frame []byte, localTSAP, remoteTSAP uint16, offeredT
 				result.TPDUSize = peerTPDU
 			}
 		case 0xc1:
-			if length != 2 || binary.BigEndian.Uint16(value) != remoteTSAP {
-				return ConnectionConfirm{}, fmt.Errorf("isotcp: source TSAP mismatch")
+			if length != 2 {
+				return ConnectionConfirm{}, fmt.Errorf("isotcp: invalid source TSAP parameter")
 			}
+			got := binary.BigEndian.Uint16(value)
+			sourceTSAP = &got
 		case 0xc2:
-			if length != 2 || binary.BigEndian.Uint16(value) != localTSAP {
-				return ConnectionConfirm{}, fmt.Errorf("isotcp: destination TSAP mismatch")
+			if length != 2 {
+				return ConnectionConfirm{}, fmt.Errorf("isotcp: invalid destination TSAP parameter")
 			}
+			got := binary.BigEndian.Uint16(value)
+			destinationTSAP = &got
 		}
 		offset += length
+	}
+	if sourceTSAP != nil && destinationTSAP != nil {
+		standardOrder := *sourceTSAP == remoteTSAP && *destinationTSAP == localTSAP
+		echoOrder := *sourceTSAP == localTSAP && *destinationTSAP == remoteTSAP
+		if !standardOrder && !echoOrder {
+			return ConnectionConfirm{}, fmt.Errorf("isotcp: TSAP pair mismatch")
+		}
+	} else {
+		if sourceTSAP != nil && *sourceTSAP != remoteTSAP {
+			return ConnectionConfirm{}, fmt.Errorf("isotcp: source TSAP mismatch")
+		}
+		if destinationTSAP != nil && *destinationTSAP != localTSAP {
+			return ConnectionConfirm{}, fmt.Errorf("isotcp: destination TSAP mismatch")
+		}
 	}
 	return result, nil
 }

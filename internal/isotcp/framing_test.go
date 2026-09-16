@@ -80,6 +80,24 @@ func TestConnectionRequestAndConfirm(t *testing.T) {
 	}
 }
 
+func TestConnectionConfirmAcceptsLegacyEchoedTSAPOrder(t *testing.T) {
+	request, err := BuildConnectionRequest(0x0100, 0x0101, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirm := append([]byte(nil), request...)
+	confirm[5] = 0xd0
+	binary.BigEndian.PutUint16(confirm[6:8], 1)
+
+	if _, err := ParseConnectionConfirm(confirm, 0x0100, 0x0101, 1024); err != nil {
+		t.Fatalf("legacy peer echoed the requested TSAP order: %v", err)
+	}
+	confirm[20] = 0xff
+	if _, err := ParseConnectionConfirm(confirm, 0x0100, 0x0101, 1024); err == nil {
+		t.Fatal("expected unrelated TSAP pair to be rejected")
+	}
+}
+
 func TestTPDUSizeSelectionAndPeerReduction(t *testing.T) {
 	for _, test := range []struct {
 		pdu  int
